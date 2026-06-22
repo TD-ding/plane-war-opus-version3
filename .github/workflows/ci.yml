@@ -1,0 +1,24 @@
+name: CI
+
+# 单文件 HTML Canvas 游戏：跳过 Docker/容器化，仅对抽出的核心纯逻辑跑单测。
+# 使用 Node 内置 test runner（node --test），无需安装任何第三方依赖。
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run unit tests (Node built-in test runner)
+        run: node --test

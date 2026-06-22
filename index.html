@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>飞机大战 · Plane War</title>
+<style>
+  /* ===================== 样式区 ===================== */
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #0b1026;
+    color: #e6ecff;
+    font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    gap: 12px;
+  }
+  #game {
+    background: linear-gradient(180deg, #0a1330 0%, #060a1c 100%);
+    border: 1px solid #2a3a72;
+    border-radius: 8px;
+    box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+    touch-action: none;
+  }
+  .hint {
+    font-size: 13px;
+    color: #8ea0d8;
+    letter-spacing: 0.3px;
+  }
+  .hint b { color: #cfe0ff; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <canvas id="game" width="480" height="720"></canvas>
+    <div class="hint">
+      移动：<b>方向键 / WASD</b> &nbsp;·&nbsp; 射击：<b>自动 + 空格</b> &nbsp;·&nbsp; 开始/重开：<b>回车</b>
+    </div>
+  </div>
+
+<script>
+"use strict";
+
+/* ============================================================
+ * 飞机大战 (Plane War) — HTML5 Canvas 单文件实现
+ *
+ * 分区说明：
+ *   1. 配置与全局状态 (CONFIG / GameState)
+ *   2. 输入处理 (Input)
+ *   3. 实体类 (Player / Bullet / Enemy / Particle)
+ *   4. 生成器与碰撞检测 (spawn / collision)
+ *   5. 主循环 (update / render / loop)
+ * ============================================================ */
+
+(function () {
+
+  /* ===================== 1. 配置与全局状态 ===================== */
+
+  const canvas = document.getElementById("game");
+  if (!canvas || !canvas.getContext) {
+    alert("当前浏览器不支持 HTML5 Canvas，无法运行游戏。");
+    return;
+  }
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width;
+  const H = canvas.height;
+
+  const CONFIG = {
+    player: { w: 38, h: 44, speed: 5, maxHp: 5, fireInterval: 220 },
+    bullet: { w: 5, h: 14, speed: 9, damage: 1 },
+    enemy:  { baseSpeed: 1.6, baseSpawn: 900, minSpawn: 320 },
+  };
+
+  // 游戏状态机：'ready' | 'playing' | 'over'
+  const Game = {
+    state: "ready",
+    score: 0,
+    best: 0,
+    hp: CONFIG.player.maxHp,
+    elapsed: 0,        // 已进行时间(ms)，用于难度递增
+    lastEnemySpawn: 0,
+    lastFire: 0,
+  };
+
+  // 读取本地最高分（带容错）
+  try {
+    const saved = parseInt(localStorage.getItem("planeWarBest") || "0", 10);
+    if (!isNaN(saved)) Game.best = saved;
+  } catch (e) { /* localStorage 不可用时忽略 */ }
+
+  let player = null;
+  let bullets = [];
+  let enemies = [];
+  let particles = [];
+  let stars = [];
+
+  /* ===================== 2. 输入处理 ===================== */
+
+  const keys = Object.create(null);
+
+  function onKeyDown(e) {
+    const k = e.key.toLowerCase();
+    keys[k] = true;
+    // 阻止方向键/空格滚动页面
+    if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) {
+      e.preventDefault();
+    }
+    if (k === "enter") {
+      if (Game.state === "ready" || Game.state === "over") startGame();
+    }
+  }
+  function onKeyUp(e) {
+    keys[e.key.toLowerCase()] = false;
+  }
+  window.addEventListener("keydown", onKeyDown);
+  window.addEventListener("keyup", onKeyUp);
+
+  // 触屏/鼠标：拖动飞机（移动端友好）
+  let pointerActive = false;
+  function pointerMove(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+    const x = (clientX - rect.left) * (W / rect.width);
+    const y = (clientY - rect.top) * (H / rect.height);
+    if (player) { player.targetX = x; player.targetY = y; }
+  }
+  canvas.addEventListener("pointerdown", (e) => {
+    pointerActive = true;
+    pointerMove(e.clientX, e.clientY);
+    if (Game.state === "ready" || Game.state === "over") startGame();
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (pointerActive) pointerMove(e.clientX, e.clientY);
+  });
+  window.addEventListener("pointerup", () => { pointerActive = false; });
+
+  /* ===================== 3. 实体类 ===================== */
+
+  class Player {
+    constructor() {
+      this.w = CONFIG.player.w;
+      this.h = CONFIG.player.h;
+      this.x = W / 2;
+      this.y = H - 90;
+      this.targetX = this.x;   // 指针拖动目标
+      this.targetY = this.y;
+      this.hitFlash = 0;       // 受击闪烁计时
+    }
+    update(dt) {
+      const s = CONFIG.player.speed;
+      // 键盘移动
+      if (keys["arrowleft"] || keys["a"]) this.x -= s;
+      if (keys["arrowright"] || keys["d"]) this.x += s;
+      if (keys["arrowup"] || keys["w"]) this.y -= s;
+      if (keys["arrowdown"] || keys["s"]) this.y += s;
+      // 指针拖动（平滑趋近）
+      if (pointerActive) {
+        this.x += (this.targetX - this.x) * 0.35;
+        this.y += (this.targetY - this.y) * 0.35;
+      }
+      // 边界约束
+      const hw = this.w / 2, hh = this.h / 2;
+      this.x = Math.max(hw, Math.min(W - hw, this.x));
+      this.y = Math.max(hh, Math.min(H - hh, this.y));
+      if (this.hitFlash > 0) this.hitFlash -= dt;
+    }
+    draw() {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      if (this.hitFlash > 0 && Math.floor(this.hitFlash / 60) % 2 === 0) {
+        ctx.globalAlpha = 0.4;
+      }
+      // 机身
+      ctx.fillStyle = "#5ad1ff";
+      ctx.beginPath();
+      ctx.moveTo(0, -this.h / 2);
+      ctx.lineTo(this.w / 2, this.h / 2);
+      ctx.lineTo(0, this.h / 2 - 8);
+      ctx.lineTo(-this.w / 2, this.h / 2);
+      ctx.closePath();
+      ctx.fill();
+      // 座舱
+      ctx.fillStyle = "#cdefff";
+      ctx.beginPath();
+      ctx.arc(0, -4, 5, 0, Math.PI * 2);
+      ctx.fill();
+      // 尾焰
+      ctx.fillStyle = "rgba(255,170,60," + (0.5 + Math.random() * 0.4).toFixed(2) + ")";
+      ctx.beginPath();
+      ctx.moveTo(-6, this.h / 2 - 6);
+      ctx.lineTo(0, this.h / 2 + 8 + Math.random() * 6);
+      ctx.lineTo(6, this.h / 2 - 6);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  class Bullet {
+    constructor(x, y) {
+      this.x = x;
+      this.y = y;
+      this.w = CONFIG.bullet.w;
+      this.h = CONFIG.bullet.h;
+      this.dead = false;
+    }
+    update() {
+      this.y -= CONFIG.bullet.speed;
+      if (this.y + this.h < 0) this.dead = true;
+    }
+    draw() {
+      ctx.fillStyle = "#ffe680";
+      ctx.fillRect(this.x - this.w / 2, this.y - this.h / 2, this.w, this.h);
+    }
+  }
+
+  class Enemy {
+    constructor(speedScale) {
+      this.w = 30 + Math.random() * 16;
+      this.h = this.w * 0.9;
+      this.x = this.w / 2 + Math.random() * (W - this.w);
+      this.y = -this.h;
+      this.speed = CONFIG.enemy.baseSpeed * speedScale + Math.random() * 0.8;
+      this.hp = this.w > 40 ? 2 : 1;       // 大敌机血厚
+      this.value = this.hp === 2 ? 30 : 10;
+      this.dead = false;
+      this.wobble = Math.random() * Math.PI * 2;
+    }
+    update() {
+      this.y += this.speed;
+      this.wobble += 0.05;
+      this.x += Math.sin(this.wobble) * 0.6;   // 轻微左右摆动
+      if (this.y - this.h > H) this.dead = true; // 飞出屏幕（玩家漏掉）
+    }
+    draw() {
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.fillStyle = this.hp === 2 ? "#ff6b9d" : "#ff8a5a";
+      ctx.beginPath();
+      ctx.moveTo(0, this.h / 2);
+      ctx.lineTo(this.w / 2, -this.h / 2);
+      ctx.lineTo(0, -this.h / 2 + 8);
+      ctx.lineTo(-this.w / 2, -this.h / 2);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "#3a0a1a";
+      ctx.beginPath();
+      ctx.arc(0, 2, 4, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  class Particle {
+    constructor(x, y, color) {
+      this.x = x;
+      this.y = y;
+      const a = Math.random() * Math.PI * 2;
+      const sp = 1 + Math.random() * 4;
+      this.vx = Math.cos(a) * sp;
+      this.vy = Math.sin(a) * sp;
+      this.life = 400 + Math.random() * 300;
+      this.maxLife = this.life;
+      this.color = color;
+      this.size = 2 + Math.random() * 3;
+      this.dead = false;
+    }
+    update(dt) {
+      this.x += this.vx;
+      this.y += this.vy;
+      this.vx *= 0.94;
+      this.vy *= 0.94;
+      this.life -= dt;
+      if (this.life <= 0) this.dead = true;
+    }
+    draw() {
+      ctx.globalAlpha = Math.max(0, this.life / this.maxLife);
+      ctx.fillStyle = this.color;
+      ctx.fillRect(this.x, this.y, this.size, this.size);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  // 背景星空
+  function initStars() {
+    stars = [];
+    for (let i = 0; i < 70; i++) {
+      stars.push({
+        x: Math.random() * W,
+        y: Math.random() * H,
+        r: Math.random() * 1.6 + 0.3,
+        sp: Math.random() * 1.5 + 0.4,
+      });
+    }
+  }
+
+  /* ===================== 4. 生成器与碰撞检测 ===================== */
+
+  function spawnExplosion(x, y, color, count) {
+    for (let i = 0; i < count; i++) particles.push(new Particle(x, y, color));
+  }
+
+  function fire() {
+    if (!player) return;
+    bullets.push(new Bullet(player.x, player.y - player.h / 2));
+  }
+
+  // 难度随时间递增：敌机更快、刷新更密
+  function difficultyScale() {
+    return 1 + Math.min(2.0, Game.elapsed / 30000); // 30s 后逐步提速
+  }
+  function spawnInterval() {
+    const reduce = Math.min(560, Game.elapsed / 60);
+    return Math.max(CONFIG.enemy.minSpawn, CONFIG.enemy.baseSpawn - reduce);
+  }
+
+  // AABB 矩形相交检测
+  function hit(a, b) {
+    return Math.abs(a.x - b.x) * 2 < (a.w + b.w) &&
+           Math.abs(a.y - b.y) * 2 < (a.h + b.h);
+  }
+
+  function handleCollisions() {
+    // 子弹 vs 敌机
+    for (const b of bullets) {
+      if (b.dead) continue;
+      for (const e of enemies) {
+        if (e.dead) continue;
+        if (hit(b, e)) {
+          b.dead = true;
+          e.hp -= CONFIG.bullet.damage;
+          spawnExplosion(b.x, b.y, "#ffd27f", 4);
+          if (e.hp <= 0) {
+            e.dead = true;
+            Game.score += e.value;
+            spawnExplosion(e.x, e.y, "#ff9a5a", 16);
+          }
+          break;
+        }
+      }
+    }
+    // 敌机 vs 玩家
+    if (player) {
+      for (const e of enemies) {
+        if (e.dead) continue;
+        if (hit(player, e)) {
+          e.dead = true;
+          spawnExplosion(e.x, e.y, "#ff5a7a", 18);
+          damagePlayer();
+        }
+      }
+    }
+  }
+
+  function damagePlayer() {
+    Game.hp -= 1;
+    if (player) player.hitFlash = 600;
+    if (Game.hp <= 0) {
+      Game.hp = 0;
+      endGame();
+    }
+  }
+
+  /* ===================== 状态切换 ===================== */
+
+  function startGame() {
+    Game.state = "playing";
+    Game.score = 0;
+    Game.hp = CONFIG.player.maxHp;
+    Game.elapsed = 0;
+    Game.lastEnemySpawn = 0;
+    Game.lastFire = 0;
+    bullets = [];
+    enemies = [];
+    particles = [];
+    player = new Player();
+  }
+
+  function endGame() {
+    Game.state = "over";
+    if (Game.score > Game.best) {
+      Game.best = Game.score;
+      try { localStorage.setItem("planeWarBest", String(Game.best)); }
+      catch (e) { /* 忽略存储失败 */ }
+    }
+    if (player) spawnExplosion(player.x, player.y, "#5ad1ff", 28);
+  }
+
+  /* ===================== 5. 主循环 ===================== */
+
+  function update(dt) {
+    // 星空始终滚动
+    for (const s of stars) {
+      s.y += s.sp;
+      if (s.y > H) { s.y = 0; s.x = Math.random() * W; }
+    }
+    // 粒子始终更新（用于结束动画）
+    for (const p of particles) p.update(dt);
+    particles = particles.filter((p) => !p.dead);
+
+    if (Game.state !== "playing") return;
+
+    Game.elapsed += dt;
+
+    // 玩家
+    player.update(dt);
+
+    // 射击：自动开火 + 空格
+    Game.lastFire += dt;
+    const wantFire = true; // 自动射击；空格仍可由玩家“感觉”控制（这里恒为自动）
+    if (Game.lastFire >= CONFIG.player.fireInterval && wantFire) {
+      fire();
+      Game.lastFire = 0;
+    }
+
+    // 子弹
+    for (const b of bullets) b.update();
+    bullets = bullets.filter((b) => !b.dead);
+
+    // 敌机生成
+    Game.lastEnemySpawn += dt;
+    if (Game.lastEnemySpawn >= spawnInterval()) {
+      enemies.push(new Enemy(difficultyScale()));
+      Game.lastEnemySpawn = 0;
+    }
+    for (const e of enemies) e.update();
+    enemies = enemies.filter((e) => !e.dead);
+
+    // 碰撞
+    handleCollisions();
+  }
+
+  function drawBackground() {
+    ctx.fillStyle = "#070b1e";
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#aab6e8";
+    for (const s of stars) {
+      ctx.globalAlpha = 0.5 + s.r / 3;
+      ctx.fillRect(s.x, s.y, s.r, s.r);
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    ctx.fillStyle = "#e6ecff";
+    ctx.font = "bold 18px sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText("得分 " + Game.score, 14, 28);
+    ctx.textAlign = "right";
+    ctx.fillText("最高 " + Game.best, W - 14, 28);
+
+    // 生命值（心形方块）
+    ctx.textAlign = "left";
+    for (let i = 0; i < CONFIG.player.maxHp; i++) {
+      ctx.fillStyle = i < Game.hp ? "#ff5a7a" : "#3a3f5c";
+      ctx.fillRect(14 + i * 22, 40, 16, 14);
+    }
+  }
+
+  function drawCenterText(title, sub) {
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e6ecff";
+    ctx.font = "bold 40px sans-serif";
+    ctx.fillText(title, W / 2, H / 2 - 20);
+    ctx.fillStyle = "#9fb0e8";
+    ctx.font = "16px sans-serif";
+    ctx.fillText(sub, W / 2, H / 2 + 24);
+  }
+
+  function render() {
+    drawBackground();
+
+    for (const p of particles) p.draw();
+
+    if (Game.state === "playing") {
+      for (const b of bullets) b.draw();
+      for (const e of enemies) e.draw();
+      if (player) player.draw();
+      drawHUD();
+    } else if (Game.state === "ready") {
+      drawCenterText("飞机大战", "按 回车 / 点击屏幕 开始");
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#6f7fb0";
+      ctx.font = "13px sans-serif";
+      ctx.fillText("方向键 / WASD 移动 · 自动射击", W / 2, H / 2 + 60);
+    } else if (Game.state === "over") {
+      drawHUD();
+      drawCenterText("游戏结束", "本局得分 " + Game.score);
+      ctx.textAlign = "center";
+      ctx.fillStyle = "#9fb0e8";
+      ctx.font = "16px sans-serif";
+      ctx.fillText("按 回车 / 点击 重新开始", W / 2, H / 2 + 60);
+    }
+  }
+
+  // 主循环（带 dt 钳制，防止切后台后 dt 暴增）
+  let lastTime = 0;
+  function loop(now) {
+    let dt = now - lastTime;
+    lastTime = now;
+    if (!isFinite(dt) || dt < 0) dt = 16;
+    if (dt > 50) dt = 50; // 钳制
+
+    try {
+      update(dt);
+      render();
+    } catch (err) {
+      // 运行时错误兜底：避免循环彻底崩溃
+      console.error("游戏运行出错:", err);
+      ctx.fillStyle = "#ff5a7a";
+      ctx.font = "14px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("发生错误，请刷新页面", W / 2, H / 2);
+    }
+    requestAnimationFrame(loop);
+  }
+
+  /* ===================== 启动 ===================== */
+  initStars();
+  requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>

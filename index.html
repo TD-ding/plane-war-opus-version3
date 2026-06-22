@@ -46,6 +46,10 @@
     </div>
   </div>
 
+<!-- 核心纯逻辑模块（碰撞/连击/火力/难度/帧率归一化/最高分防御）。
+     被 Node 单测覆盖；浏览器里挂到 window.PlaneWarLogic。
+     即使此文件缺失，下方内联实现仍可独立运行，保证单文件可玩。 -->
+<script src="src/logic.js"></script>
 <script>
 "use strict";
 
@@ -61,6 +65,11 @@
  * ============================================================ */
 
 (function () {
+
+  // 共享核心逻辑模块（src/logic.js）。存在时优先调用它，让浏览器与 Node
+  // 单测跑的是同一份实现；缺失时（单文件独立打开且无该文件）回退到本文件
+  // 内联实现，保证 index.html 始终可玩。
+  const L = (typeof window !== "undefined" && window.PlaneWarLogic) || null;
 
   /* ===================== 1. 配置与全局状态 ===================== */
 
@@ -250,10 +259,14 @@
     shieldTime: 0,     // 剩余护盾时间(ms)，>0 时被撞不掉血
   };
 
-  // 读取本地最高分（带容错：非数字或被篡改为负数时忽略）
+  // 读取本地最高分（带容错：非数字或被篡改为负数时忽略，归一为 0）
   try {
-    const saved = parseInt(localStorage.getItem("planeWarBest") || "0", 10);
-    if (!isNaN(saved) && saved >= 0) Game.best = saved;
+    const raw = localStorage.getItem("planeWarBest");
+    Game.best = L ? L.parseBestScore(raw, 0)
+                  : (function () {
+                      const saved = parseInt(raw == null ? "0" : raw, 10);
+                      return (!isNaN(saved) && saved >= 0) ? saved : 0;
+                    })();
   } catch (e) { /* localStorage 不可用时忽略 */ }
 
   let player = null;
@@ -750,7 +763,7 @@
   // 帧率归一化系数：把“按 60fps 每帧”设计的位移量换算成与帧率无关的步进。
   // 例如 144Hz 屏幕单帧 dt≈6.9ms，ts≈0.42，位移按比例缩小，整体速度保持一致。
   function timeScale(dt) {
-    return dt / CONFIG.baseFrameMs;
+    return L ? L.timeScale(dt, CONFIG.baseFrameMs) : dt / CONFIG.baseFrameMs;
   }
 
   // 在 (x,y) 处生成一组爆炸粒子。fx 为 CONFIG.fx 中的某项 { count, color }
@@ -794,6 +807,7 @@
 
   // 连击当前得分倍率：取连击数所达到的最高档
   function comboMultiplier() {
+    if (L) return L.comboMultiplier(Game.combo, CONFIG.combo.tiers);
     let mult = 1;
     for (const tier of CONFIG.combo.tiers) {
       if (Game.combo >= tier.combo) mult = tier.mult;
@@ -809,11 +823,13 @@
 
   // 火力升一级（达上限则不变）
   function addPower() {
-    if (Game.power < CONFIG.power.max) Game.power += 1;
+    Game.power = L ? L.addPower(Game.power, CONFIG.power.max)
+                   : (Game.power < CONFIG.power.max ? Game.power + 1 : Game.power);
   }
   // 被撞降一级（不低于 1）
   function dropPower() {
-    if (Game.power > 1) Game.power -= 1;
+    Game.power = L ? L.dropPower(Game.power)
+                   : (Game.power > 1 ? Game.power - 1 : Game.power);
   }
 
   // 按权重随机选一种道具类型
@@ -875,10 +891,17 @@
   // 难度随时间递增：敌机更快、刷新更密
   function difficultyScale() {
     const d = CONFIG.difficulty;
+    if (L) return L.difficultyScale(Game.elapsed, d.rampMs, d.maxSpeedScale);
     return 1 + Math.min(d.maxSpeedScale, Game.elapsed / d.rampMs);
   }
   function spawnInterval() {
     const d = CONFIG.difficulty;
+    if (L) return L.spawnInterval(Game.elapsed, {
+      baseSpawn: CONFIG.enemy.baseSpawn,
+      minSpawn: CONFIG.enemy.minSpawn,
+      spawnReduceCap: d.spawnReduceCap,
+      spawnReduceRate: d.spawnReduceRate,
+    });
     const reduce = Math.min(d.spawnReduceCap, Game.elapsed / d.spawnReduceRate);
     return Math.max(CONFIG.enemy.minSpawn, CONFIG.enemy.baseSpawn - reduce);
   }
@@ -887,6 +910,7 @@
   // sa/sb 为 a、b 各自的命中范围缩放（默认 1 = 用完整尺寸）；
   // 玩家碰撞时传入较小的 scale，只让机身中间一小块算被撞。
   function hit(a, b, sa, sb) {
+    if (L) return L.hit(a, b, sa, sb);
     const aw = a.w * (sa || 1), ah = a.h * (sa || 1);
     const bw = b.w * (sb || 1), bh = b.h * (sb || 1);
     return Math.abs(a.x - b.x) * 2 < (aw + bw) &&

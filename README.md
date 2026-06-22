@@ -37,13 +37,26 @@
 
 ```
 plane-war-opus-version3/
-├── index.html   # 游戏全部内容（HTML + CSS + JS 单文件）
-└── README.md    # 项目说明
+├── index.html              # 游戏全部内容（HTML + CSS + JS 单文件，浏览器游玩入口）
+├── src/
+│   └── logic.js            # 抽出的核心纯逻辑（碰撞/连击/火力/难度/帧率/最高分），供测试覆盖
+├── tests/
+│   └── logic.test.js       # 核心纯逻辑单元测试（node:test，零第三方依赖）
+├── docs/
+│   ├── deployment.md       # 部署与运行（如何打开、如何跑测试、版本要求、CI）
+│   └── gameplay.md         # 玩法说明（操作按键、各系统、核心机制）
+├── .github/
+│   └── workflows/
+│       └── ci.yml          # GitHub Actions：node --test 跑核心逻辑单测
+├── .gitignore
+└── README.md               # 项目说明
 ```
+
+> `src/logic.js` 仅用于让核心纯逻辑可在 Node 里被单测覆盖；浏览器游玩只依赖 `index.html`（内含语义一致的实现），单文件即可独立打开。
 
 ## 如何运行
 
-方式一：直接双击打开 `index.html`，用任意现代浏览器（Chrome / Edge / Firefox / Safari）即可游玩。
+方式一：直接双击打开 `index.html`，用任意现代浏览器（Chrome / Edge / Firefox / Safari）即可游玩。**零依赖，无需构建或安装。**
 
 方式二（推荐，避免个别浏览器本地文件限制）：在项目目录启动一个本地静态服务器：
 
@@ -52,6 +65,18 @@ plane-war-opus-version3/
 python3 -m http.server 8000
 # 然后浏览器访问 http://localhost:8000
 ```
+
+更多细节见 [docs/deployment.md](docs/deployment.md)。
+
+## 运行测试
+
+核心纯逻辑由 Node 内置 test runner 覆盖，**无需 `npm install`**。要求 **Node.js ≥ 18**（CI 使用 Node 22）。在项目目录执行：
+
+```bash
+node --test
+```
+
+预期全部用例通过（当前 33 个）。详见 [docs/deployment.md](docs/deployment.md)。
 
 ## 操作说明
 
@@ -63,6 +88,8 @@ python3 -m http.server 8000
 | 暂停 / 继续 | `P` 或 `Esc` |
 | 静音 / 取消静音 | `M` |
 | 开始 / 重新开始 | `回车` 或 点击屏幕 |
+
+更详细的玩法、各系统数值与核心机制（帧率无关、无敌帧、判定盒）见 [docs/gameplay.md](docs/gameplay.md)。
 
 ## 玩法提示
 

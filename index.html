@@ -42,7 +42,7 @@
   <div id="wrap">
     <canvas id="game" width="480" height="720"></canvas>
     <div class="hint">
-      移动：<b>方向键 / WASD</b> &nbsp;·&nbsp; 射击：<b>自动（空格加射）</b> &nbsp;·&nbsp; 暂停：<b>P / Esc</b> &nbsp;·&nbsp; 开始/重开：<b>回车</b>
+      移动：<b>方向键 / WASD</b> &nbsp;·&nbsp; 射击：<b>自动（空格加射）</b> &nbsp;·&nbsp; 炸弹：<b>B</b> &nbsp;·&nbsp; 暂停：<b>P / Esc</b> &nbsp;·&nbsp; 静音：<b>M</b> &nbsp;·&nbsp; 开始/重开：<b>回车</b>
     </div>
   </div>
 
@@ -99,6 +99,23 @@
 
     bullet: { w: 5, h: 14, speed: 9, damage: 1 },
 
+    // 火力等级：随连击/道具成长，决定一次开火打出几发散射。
+    // 每升一级多一发，并向两侧张开一定角度，越猛越爽；被撞降一级。
+    power: {
+      max: 4,                // 最高火力等级（1=单发，4=四发）
+      spreadDeg: 9,          // 相邻两发之间的张角(度)
+    },
+
+    // 敌机子弹：大敌机会朝玩家方向射击，玩家需要躲避
+    enemyBullet: {
+      w: 6, h: 12,
+      speed: 3.2,            // 下落/飞行速度（像素/基准帧）
+      damage: 1,
+      color: "#ff7ed4",
+      fireMin: 1400,         // 单架大敌机两次开火最小间隔(ms)
+      fireRange: 1200,       // 开火间隔随机附加范围(ms)
+    },
+
     enemy: {
       baseSpeed: 1.6,        // 敌机基础下落速度（像素/基准帧）
       baseSpawn: 900,        // 初始刷新间隔(ms)
@@ -113,6 +130,42 @@
       wobbleAmp: 0.6,        // 左右摆动幅度（像素/基准帧）
       maxOnScreen: 12,       // 屏幕上同时存在的敌机数量上限，避免后期“一堵墙”
     },
+
+    // 连击系统：连续击中不漏接则连击数累积，得分按倍率翻倍。
+    // 超过 comboTimeout 没有新的击中则连击清零。
+    combo: {
+      timeout: 2200,         // 连击保持窗口(ms)，期间未再击毁则断连
+      // 不同连击数对应的得分倍率档位（取 <= 当前连击的最高档）
+      tiers: [
+        { combo: 0,  mult: 1 },
+        { combo: 5,  mult: 2 },
+        { combo: 10, mult: 3 },
+        { combo: 20, mult: 4 },
+      ],
+    },
+
+    // 道具掉落：敌机被击毁后有概率掉落道具，玩家飞过去拾取。
+    // 道具下落，超过 lifeMs 未拾取则消失（带闪烁预警）。
+    powerup: {
+      dropChance: 0.16,      // 每架敌机击毁后的掉落概率
+      size: 22,
+      fallSpeed: 1.4,        // 下落速度（像素/基准帧）
+      lifeMs: 7000,          // 存活时间(ms)，到期消失
+      blinkBeforeMs: 2000,   // 剩余多少 ms 开始闪烁预警
+      healAmount: 1,         // 回血道具恢复的血量
+      shieldMs: 6000,        // 护盾道具持续时间(ms)
+      // 各类型权重（掉落时按权重随机选一种）
+      weights: { power: 3, shield: 2, heal: 2, bomb: 1 },
+      colors: {
+        power: "#ffd24a", shield: "#5ad1ff", heal: "#5aff9a", bomb: "#ff7e7e",
+      },
+    },
+
+    // 清屏炸弹：拾取 bomb 道具可存储，紧急时按 B 释放，清空全屏敌机与敌弹
+    bomb: { max: 3 },
+
+    // 护盾：拾取后一段时间内被撞不掉血（与无敌不同，由道具赋予）
+    shield: { ringColor: "#5ad1ff" },
 
     particle: {
       minLife: 400, lifeRange: 300,  // 寿命(ms)
@@ -161,6 +214,19 @@
       enemyCockpit: "#3a0a1a",
       bullet: "#ffe680",
     },
+
+    // 音效：全部用 WebAudio 程序化生成（无外部音频文件）。
+    // 每项定义一个简单的振荡器“电子音”：波形、起止频率、时长、音量。
+    sound: {
+      masterVolume: 0.18,    // 总音量（偏低，避免连射时刺耳）
+      shoot:    { type: "square",   f0: 880,  f1: 660,  dur: 0.06, vol: 0.25 },
+      hit:      { type: "square",   f0: 520,  f1: 400,  dur: 0.05, vol: 0.4  },
+      explode:  { type: "sawtooth", f0: 240,  f1: 60,   dur: 0.22, vol: 0.7  },
+      crash:    { type: "sawtooth", f0: 180,  f1: 40,   dur: 0.32, vol: 0.9  },
+      pickup:   { type: "triangle", f0: 660,  f1: 1320, dur: 0.16, vol: 0.6  },
+      bomb:     { type: "sawtooth", f0: 420,  f1: 50,   dur: 0.5,  dur2: 0.5, vol: 1.0 },
+      powerup:  { type: "triangle", f0: 520,  f1: 1040, dur: 0.18, vol: 0.6  },
+    },
   };
 
   // 游戏状态机：'ready' | 'playing' | 'paused' | 'over'
@@ -176,6 +242,11 @@
     invincible: 0,     // 剩余无敌时间(ms)，>0 时玩家不再扣血
     shake: 0,          // 剩余屏幕震动时间(ms)
     shakeAmp: 0,       // 当前震动幅度(px)
+    power: 1,          // 当前火力等级（1..CONFIG.power.max）
+    combo: 0,          // 当前连击数
+    comboTimer: 0,     // 连击保持倒计时(ms)，归零则断连
+    bombs: 0,          // 库存清屏炸弹数
+    shieldTime: 0,     // 剩余护盾时间(ms)，>0 时被撞不掉血
   };
 
   // 读取本地最高分（带容错：非数字或被篡改为负数时忽略）
@@ -187,9 +258,69 @@
   let player = null;
   let bullets = [];
   let enemies = [];
+  let enemyBullets = [];   // 敌机射出的子弹
+  let powerups = [];       // 掉落道具
   let particles = [];
   let scorePops = [];
   let stars = [];
+
+  /* ===================== 音效（WebAudio 程序化生成） ===================== */
+
+  // 用 WebAudio 即时合成简单电子音，避免任何外部音频文件。
+  // 浏览器要求音频上下文在用户交互后才能启动，故首次按键/点击时惰性创建。
+  const Sound = (function () {
+    let actx = null;
+    let muted = false;
+
+    function ensure() {
+      if (actx) return actx;
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) actx = new AC();
+      } catch (e) { actx = null; }
+      return actx;
+    }
+    // 用户交互后恢复（部分浏览器初始为 suspended）
+    function resume() {
+      const a = ensure();
+      if (a && a.state === "suspended") a.resume().catch(() => {});
+    }
+
+    // 播放一个频率从 f0 滑到 f1 的短音；带快速衰减包络，听感像“电子音效”
+    function play(spec) {
+      if (muted || !spec) return;
+      const a = ensure();
+      if (!a) return;
+      try {
+        const now = a.currentTime;
+        const osc = a.createOscillator();
+        const gain = a.createGain();
+        osc.type = spec.type || "square";
+        osc.frequency.setValueAtTime(spec.f0, now);
+        osc.frequency.exponentialRampToValueAtTime(
+          Math.max(1, spec.f1), now + spec.dur);
+        const vol = CONFIG.sound.masterVolume * (spec.vol == null ? 1 : spec.vol);
+        gain.gain.setValueAtTime(vol, now);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + spec.dur);
+        osc.connect(gain).connect(a.destination);
+        osc.start(now);
+        osc.stop(now + spec.dur + 0.02);
+      } catch (e) { /* 音频失败不影响游戏 */ }
+    }
+
+    return {
+      resume,
+      toggleMute() { muted = !muted; return muted; },
+      isMuted() { return muted; },
+      shoot()   { play(CONFIG.sound.shoot); },
+      hit()     { play(CONFIG.sound.hit); },
+      explode() { play(CONFIG.sound.explode); },
+      crash()   { play(CONFIG.sound.crash); },
+      pickup()  { play(CONFIG.sound.pickup); },
+      powerup() { play(CONFIG.sound.powerup); },
+      bomb()    { play(CONFIG.sound.bomb); },
+    };
+  })();
 
   /* ===================== 2. 输入处理 ===================== */
 
@@ -200,6 +331,8 @@
     if (typeof e.key !== "string" || e.key === "") return;
     const k = e.key.toLowerCase();
     keys[k] = true;
+    // 任意按键都尝试恢复音频上下文（浏览器要求用户交互后才能发声）
+    Sound.resume();
     // 阻止方向键/空格滚动页面
     if ([" ", "arrowup", "arrowdown", "arrowleft", "arrowright"].includes(k)) {
       e.preventDefault();
@@ -210,6 +343,14 @@
     // 暂停 / 继续：P 或 Esc，仅在游戏进行/暂停态间切换
     if (k === "p" || k === "escape") {
       togglePause();
+    }
+    // 清屏炸弹：B 键，库存 > 0 且游戏进行中时释放
+    if (k === "b") {
+      useBomb();
+    }
+    // 静音开关：M 键
+    if (k === "m") {
+      Sound.toggleMute();
     }
   }
   function onKeyUp(e) {
@@ -229,6 +370,7 @@
   }
   canvas.addEventListener("pointerdown", (e) => {
     pointerActive = true;
+    Sound.resume();
     pointerMove(e.clientX, e.clientY);
     if (Game.state === "ready" || Game.state === "over") startGame();
   });
@@ -333,16 +475,25 @@
   }
 
   class Bullet {
-    constructor(x, y) {
+    constructor(x, y, angle) {
       this.x = x;
       this.y = y;
       this.w = CONFIG.bullet.w;
       this.h = CONFIG.bullet.h;
       this.dead = false;
+      // angle: 相对正上方的偏角(弧度)，0 = 竖直向上。用于散射。
+      const a = angle || 0;
+      const sp = CONFIG.bullet.speed;
+      this.vx = Math.sin(a) * sp;
+      this.vy = -Math.cos(a) * sp;
     }
     update(dt) {
-      this.y -= CONFIG.bullet.speed * timeScale(dt);
-      if (this.y + this.h < 0) this.dead = true;
+      const ts = timeScale(dt);
+      this.x += this.vx * ts;
+      this.y += this.vy * ts;
+      if (this.y + this.h < 0 || this.x + this.w < 0 || this.x - this.w > W) {
+        this.dead = true;
+      }
     }
     draw() {
       ctx.fillStyle = CONFIG.colors.bullet;
@@ -359,10 +510,15 @@
       this.y = -this.h;
       this.speed = ec.baseSpeed * speedScale + Math.random() * ec.speedJitter;
       const big = this.w > ec.bigHpSize;
+      this.big = big;
       this.hp = big ? ec.bigHp : ec.smallHp;       // 大敌机血厚
       this.value = big ? ec.bigValue : ec.smallValue;
       this.dead = false;
       this.wobble = Math.random() * Math.PI * 2;
+      // 大敌机会开火：初始化下一次开火倒计时
+      this.canShoot = big;
+      this.fireTimer = CONFIG.enemyBullet.fireMin +
+        Math.random() * CONFIG.enemyBullet.fireRange;
     }
     update(dt) {
       const ts = timeScale(dt);
@@ -370,12 +526,21 @@
       this.y += this.speed * ts;
       this.wobble += ec.wobbleSpeed * ts;
       this.x += Math.sin(this.wobble) * ec.wobbleAmp * ts;   // 轻微左右摆动
+      // 大敌机进入屏幕后按计时朝玩家方向开火
+      if (this.canShoot && this.y > 0 && Game.state === "playing") {
+        this.fireTimer -= dt;
+        if (this.fireTimer <= 0) {
+          enemyFire(this);
+          this.fireTimer = CONFIG.enemyBullet.fireMin +
+            Math.random() * CONFIG.enemyBullet.fireRange;
+        }
+      }
       if (this.y - this.h > H) this.dead = true; // 飞出屏幕（玩家漏掉）
     }
     draw() {
       drawAt(this.x, this.y, () => {
         const col = CONFIG.colors;
-        ctx.fillStyle = this.hp === CONFIG.enemy.bigHp ? col.enemyBig : col.enemySmall;
+        ctx.fillStyle = this.big ? col.enemyBig : col.enemySmall;
         ctx.beginPath();
         ctx.moveTo(0, this.h / 2);
         ctx.lineTo(this.w / 2, -this.h / 2);
@@ -423,6 +588,85 @@
       ctx.globalAlpha = Math.max(0, this.life / this.maxLife);
       ctx.fillStyle = this.color;
       ctx.fillRect(this.x, this.y, this.size, this.size);
+      ctx.restore();
+    }
+  }
+
+  // 敌机子弹：从大敌机射出，朝玩家当时的方向飞行
+  class EnemyBullet {
+    constructor(x, y, vx, vy) {
+      const eb = CONFIG.enemyBullet;
+      this.x = x;
+      this.y = y;
+      this.w = eb.w;
+      this.h = eb.h;
+      this.vx = vx;
+      this.vy = vy;
+      this.dead = false;
+    }
+    update(dt) {
+      const ts = timeScale(dt);
+      this.x += this.vx * ts;
+      this.y += this.vy * ts;
+      // 飞出屏幕任一边界即回收
+      if (this.y - this.h > H || this.y + this.h < 0 ||
+          this.x + this.w < 0 || this.x - this.w > W) this.dead = true;
+    }
+    draw() {
+      ctx.save();
+      ctx.fillStyle = CONFIG.enemyBullet.color;
+      ctx.beginPath();
+      ctx.ellipse(this.x, this.y, this.w / 2, this.h / 2, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // 掉落道具：从击毁位置下落，玩家碰到即拾取；到期未拾取则闪烁后消失。
+  // type: 'power' | 'shield' | 'heal' | 'bomb'
+  class Powerup {
+    constructor(x, y, type) {
+      const pc = CONFIG.powerup;
+      this.x = x;
+      this.y = y;
+      this.w = pc.size;
+      this.h = pc.size;
+      this.type = type;
+      this.life = pc.lifeMs;
+      this.dead = false;
+    }
+    update(dt) {
+      this.y += CONFIG.powerup.fallSpeed * timeScale(dt);
+      this.life -= dt;
+      if (this.life <= 0 || this.y - this.h > H) this.dead = true;
+    }
+    draw() {
+      const pc = CONFIG.powerup;
+      ctx.save();
+      // 临近消失时闪烁预警
+      if (this.life < pc.blinkBeforeMs &&
+          Math.floor(this.life / 150) % 2 === 0) {
+        ctx.globalAlpha = 0.35;
+      }
+      drawAt(this.x, this.y, () => {
+        const r = this.w / 2;
+        const color = pc.colors[this.type] || "#ffffff";
+        // 圆角方块底
+        ctx.fillStyle = "rgba(8,12,28,0.85)";
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        // 中心图标字符，简单标识类型
+        ctx.fillStyle = color;
+        ctx.font = "bold 14px sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const icon = { power: "▲", shield: "◈", heal: "+", bomb: "✸" }[this.type] || "?";
+        ctx.fillText(icon, 0, 1);
+      });
       ctx.restore();
     }
   }
@@ -498,7 +742,110 @@
 
   function fire() {
     if (!player) return;
-    bullets.push(new Bullet(player.x, player.y - player.h / 2));
+    const px = player.x;
+    const py = player.y - player.h / 2;
+    const level = Math.max(1, Math.min(CONFIG.power.max, Game.power));
+    const spread = CONFIG.power.spreadDeg * Math.PI / 180;
+    // 火力等级决定发数：以正上方为中心，向两侧对称张开。
+    // 1 发竖直；2 发对称偏角；3 发中间竖直 + 两侧；4 发对称四发……
+    for (let i = 0; i < level; i++) {
+      // 角度偏移：让 level 发均匀分布于 [-(level-1)/2, +(level-1)/2] * spread
+      const angle = (i - (level - 1) / 2) * spread;
+      bullets.push(new Bullet(px, py, angle));
+    }
+    Sound.shoot();
+  }
+
+  // 大敌机朝玩家当前位置发射一颗子弹
+  function enemyFire(enemy) {
+    if (!player) return;
+    const eb = CONFIG.enemyBullet;
+    const dx = player.x - enemy.x;
+    const dy = player.y - enemy.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const vx = (dx / len) * eb.speed;
+    const vy = (dy / len) * eb.speed;
+    enemyBullets.push(new EnemyBullet(enemy.x, enemy.y + enemy.h / 2, vx, vy));
+  }
+
+  // 连击当前得分倍率：取连击数所达到的最高档
+  function comboMultiplier() {
+    let mult = 1;
+    for (const tier of CONFIG.combo.tiers) {
+      if (Game.combo >= tier.combo) mult = tier.mult;
+    }
+    return mult;
+  }
+
+  // 击毁敌机时累加连击并刷新保持窗口
+  function addCombo() {
+    Game.combo += 1;
+    Game.comboTimer = CONFIG.combo.timeout;
+  }
+
+  // 火力升一级（达上限则不变）
+  function addPower() {
+    if (Game.power < CONFIG.power.max) Game.power += 1;
+  }
+  // 被撞降一级（不低于 1）
+  function dropPower() {
+    if (Game.power > 1) Game.power -= 1;
+  }
+
+  // 按权重随机选一种道具类型
+  function pickPowerupType() {
+    const w = CONFIG.powerup.weights;
+    const entries = Object.keys(w);
+    let total = 0;
+    for (const k of entries) total += w[k];
+    let r = Math.random() * total;
+    for (const k of entries) {
+      r -= w[k];
+      if (r <= 0) return k;
+    }
+    return entries[0];
+  }
+
+  // 敌机击毁后按概率掉落道具
+  function maybeDropPowerup(x, y) {
+    if (Math.random() < CONFIG.powerup.dropChance) {
+      powerups.push(new Powerup(x, y, pickPowerupType()));
+    }
+  }
+
+  // 拾取道具：按类型生效
+  function applyPowerup(type) {
+    const pc = CONFIG.powerup;
+    if (type === "power") {
+      addPower();
+      Sound.powerup();
+    } else if (type === "shield") {
+      Game.shieldTime = pc.shieldMs;
+      Sound.pickup();
+    } else if (type === "heal") {
+      Game.hp = Math.min(CONFIG.player.maxHp, Game.hp + pc.healAmount);
+      Sound.pickup();
+    } else if (type === "bomb") {
+      Game.bombs = Math.min(CONFIG.bomb.max, Game.bombs + 1);
+      Sound.pickup();
+    }
+  }
+
+  // 释放清屏炸弹：清空全屏敌机与敌弹，每架敌机计分 + 爆炸特效
+  function useBomb() {
+    if (Game.state !== "playing" || Game.bombs <= 0) return;
+    Game.bombs -= 1;
+    for (const e of enemies) {
+      if (e.dead) continue;
+      e.dead = true;
+      Game.score += e.value;
+      spawnExplosion(e.x, e.y, CONFIG.fx.enemyKill);
+      scorePops.push(new ScorePop(e.x, e.y, e.value));
+    }
+    // 一并清掉飞行中的敌弹
+    for (const eb of enemyBullets) eb.dead = true;
+    triggerShake(CONFIG.shake.crashAmp);
+    Sound.bomb();
   }
 
   // 难度随时间递增：敌机更快、刷新更密
@@ -532,19 +879,48 @@
           b.dead = true;
           e.hp -= CONFIG.bullet.damage;
           spawnExplosion(b.x, b.y, CONFIG.fx.bulletHit);
+          Sound.hit();
           if (e.hp <= 0) {
             e.dead = true;
-            Game.score += e.value;
+            addCombo();                                       // 累加连击
+            const gained = e.value * comboMultiplier();       // 连击倍率
+            Game.score += gained;
             spawnExplosion(e.x, e.y, CONFIG.fx.enemyKill);
-            scorePops.push(new ScorePop(e.x, e.y, e.value)); // 得分飘字
+            scorePops.push(new ScorePop(e.x, e.y, gained));   // 得分飘字
             triggerShake(CONFIG.shake.killAmp);               // 屏幕震一下
+            maybeDropPowerup(e.x, e.y);                       // 概率掉道具
+            Sound.explode();
           }
           break;
         }
       }
     }
-    // 敌机 vs 玩家：无敌时间内跳过整次判定，避免一帧内被多架敌机连扣
-    if (player && Game.invincible <= 0) {
+    // 玩家拾取道具
+    if (player) {
+      for (const pu of powerups) {
+        if (pu.dead) continue;
+        if (hit(player, pu, CONFIG.player.hitboxScale * 1.6, 1)) {
+          pu.dead = true;
+          applyPowerup(pu.type);
+        }
+      }
+    }
+    // 敌弹 vs 玩家：护盾/无敌期间不掉血
+    if (player && Game.invincible <= 0 && Game.shieldTime <= 0) {
+      for (const eb of enemyBullets) {
+        if (eb.dead) continue;
+        if (hit(player, eb, CONFIG.player.hitboxScale, 1)) {
+          eb.dead = true;
+          spawnExplosion(player.x, player.y, CONFIG.fx.playerCrash);
+          triggerShake(CONFIG.shake.crashAmp);
+          Sound.crash();
+          damagePlayer();
+          break;
+        }
+      }
+    }
+    // 敌机 vs 玩家：无敌/护盾时间内跳过整次判定，避免一帧内被多架敌机连扣
+    if (player && Game.invincible <= 0 && Game.shieldTime <= 0) {
       for (const e of enemies) {
         if (e.dead) continue;
         // 玩家命中范围缩小到机身中间一小块（hitboxScale），敌机用完整尺寸
@@ -552,6 +928,7 @@
           e.dead = true;
           spawnExplosion(e.x, e.y, CONFIG.fx.playerCrash);
           triggerShake(CONFIG.shake.crashAmp);
+          Sound.crash();
           damagePlayer();
           break; // 本次只受一击，剩余敌机留待无敌结束后再判定
         }
@@ -561,6 +938,9 @@
 
   function damagePlayer() {
     Game.hp -= 1;
+    dropPower();        // 被撞火力降一级
+    Game.combo = 0;     // 连击断掉
+    Game.comboTimer = 0;
     if (player) player.hitFlash = CONFIG.player.hitFlashMs;
     Game.invincible = CONFIG.player.invincibleMs; // 受击后给一段无敌缓冲
     if (Game.hp <= 0) {
@@ -582,8 +962,15 @@
     Game.invincible = 0;
     Game.shake = 0;
     Game.shakeAmp = 0;
+    Game.power = 1;
+    Game.combo = 0;
+    Game.comboTimer = 0;
+    Game.bombs = 0;
+    Game.shieldTime = 0;
     bullets = [];
     enemies = [];
+    enemyBullets = [];
+    powerups = [];
     particles = [];
     scorePops = [];
     player = new Player();
@@ -623,6 +1010,13 @@
 
     // 无敌计时倒数
     if (Game.invincible > 0) Game.invincible -= dt;
+    // 护盾计时倒数
+    if (Game.shieldTime > 0) Game.shieldTime -= dt;
+    // 连击保持窗口倒数，超时断连
+    if (Game.comboTimer > 0) {
+      Game.comboTimer -= dt;
+      if (Game.comboTimer <= 0) { Game.comboTimer = 0; Game.combo = 0; }
+    }
 
     // 玩家
     player.update(dt);
@@ -654,6 +1048,14 @@
     }
     for (const e of enemies) e.update(dt);
     enemies = enemies.filter((e) => !e.dead);
+
+    // 敌机子弹
+    for (const eb of enemyBullets) eb.update(dt);
+    enemyBullets = enemyBullets.filter((eb) => !eb.dead);
+
+    // 掉落道具
+    for (const pu of powerups) pu.update(dt);
+    powerups = powerups.filter((pu) => !pu.dead);
 
     // 碰撞
     handleCollisions();
@@ -687,6 +1089,36 @@
       ctx.fillStyle = i < Game.hp ? "#ff5a7a" : "#3a3f5c";
       ctx.fillRect(14 + i * 22, 40, 16, 14);
     }
+
+    // 火力等级 + 炸弹库存（生命条右侧）
+    const infoX = 14 + CONFIG.player.maxHp * 22 + 12;
+    ctx.fillStyle = "#ffd24a";
+    ctx.font = "bold 13px sans-serif";
+    ctx.fillText("火力 x" + Game.power, infoX, 52);
+    ctx.fillStyle = "#ff9a9a";
+    ctx.fillText("炸弹 " + Game.bombs + " (B)", infoX + 78, 52);
+
+    // 连击显示（右侧，连击≥2 时高亮并显示倍率）
+    if (Game.combo >= 2) {
+      const mult = comboMultiplier();
+      ctx.textAlign = "right";
+      ctx.fillStyle = "#ffe680";
+      ctx.font = "bold 22px sans-serif";
+      ctx.fillText(Game.combo + " COMBO", W - 14, 56);
+      if (mult > 1) {
+        ctx.fillStyle = "#ff8a5a";
+        ctx.font = "bold 14px sans-serif";
+        ctx.fillText("得分 x" + mult, W - 14, 74);
+      }
+    }
+
+    // 护盾剩余时间提示
+    if (Game.shieldTime > 0) {
+      ctx.textAlign = "left";
+      ctx.fillStyle = CONFIG.shield.ringColor;
+      ctx.font = "bold 13px sans-serif";
+      ctx.fillText("护盾 " + (Game.shieldTime / 1000).toFixed(1) + "s", 14, 70);
+    }
     ctx.restore();
   }
 
@@ -699,6 +1131,21 @@
     ctx.fillStyle = "#9fb0e8";
     ctx.font = "16px sans-serif";
     ctx.fillText(sub, W / 2, H / 2 + 24);
+    ctx.restore();
+  }
+
+  // 护盾光环：护盾期间在玩家四周画一圈半透明脉动圆环
+  function drawShieldRing() {
+    if (!player || Game.shieldTime <= 0) return;
+    ctx.save();
+    const r = Math.max(player.w, player.h) * 0.75;
+    const pulse = 0.4 + 0.3 * Math.sin(Game.elapsed / 120);
+    ctx.globalAlpha = pulse;
+    ctx.strokeStyle = CONFIG.shield.ringColor;
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, r, 0, Math.PI * 2);
+    ctx.stroke();
     ctx.restore();
   }
 
@@ -718,9 +1165,14 @@
     for (const sp of scorePops) sp.draw();
 
     if (Game.state === "playing" || Game.state === "paused") {
+      for (const pu of powerups) pu.draw();
       for (const b of bullets) b.draw();
+      for (const eb of enemyBullets) eb.draw();
       for (const e of enemies) e.draw();
-      if (player) player.draw();
+      if (player) {
+        drawShieldRing();   // 护盾时在玩家外画一圈光环
+        player.draw();
+      }
       drawHUD();
       if (Game.state === "paused") {
         // 半透明遮罩 + 暂停提示
@@ -736,7 +1188,8 @@
       ctx.textAlign = "center";
       ctx.fillStyle = "#6f7fb0";
       ctx.font = "13px sans-serif";
-      ctx.fillText("方向键 / WASD 移动 · 自动射击（空格加射） · P/Esc 暂停", W / 2, H / 2 + 60);
+      ctx.fillText("方向键 / WASD 移动 · 自动射击（空格加射）", W / 2, H / 2 + 56);
+      ctx.fillText("B 放炸弹 · P/Esc 暂停 · M 静音", W / 2, H / 2 + 76);
       ctx.restore();
     } else if (Game.state === "over") {
       drawHUD();

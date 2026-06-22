@@ -42,7 +42,7 @@
   <div id="wrap">
     <canvas id="game" width="480" height="720"></canvas>
     <div class="hint">
-      移动：<b>方向键 / WASD</b> &nbsp;·&nbsp; 射击：<b>自动（空格加射）</b> &nbsp;·&nbsp; 开始/重开：<b>回车</b>
+      移动：<b>方向键 / WASD</b> &nbsp;·&nbsp; 射击：<b>自动（空格加射）</b> &nbsp;·&nbsp; 暂停：<b>P / Esc</b> &nbsp;·&nbsp; 开始/重开：<b>回车</b>
     </div>
   </div>
 
@@ -91,6 +91,10 @@
       startY: 90,            // 出生时距底部高度
       hitFlashMs: 600,       // 受击闪烁持续时间(ms)
       flashBlinkMs: 60,      // 受击闪烁单次明暗切换周期(ms)
+      invincibleMs: 1200,    // 受击后无敌时间(ms)，期间不再扣血，避免密集敌机瞬间团灭
+      // 碰撞判定缩放：飞机实际命中范围只取机身中间一小块（机翼空隙不算），
+      // 让“擦边”更宽容。0.45 表示按宽高各取 45%。
+      hitboxScale: 0.45,
     },
 
     bullet: { w: 5, h: 14, speed: 9, damage: 1 },
@@ -107,6 +111,7 @@
       bigValue: 30, smallValue: 10,
       wobbleSpeed: 0.05,     // 左右摆动相位增速（每基准帧）
       wobbleAmp: 0.6,        // 左右摆动幅度（像素/基准帧）
+      maxOnScreen: 12,       // 屏幕上同时存在的敌机数量上限，避免后期“一堵墙”
     },
 
     particle: {
@@ -117,6 +122,20 @@
     },
 
     stars: { count: 70, minSpeed: 0.4, speedRange: 1.5, minR: 0.3, rRange: 1.6 },
+
+    // 得分飘字：击毁敌机时在其位置弹出 "+分数" 并上浮淡出
+    scorePop: {
+      life: 700,           // 存活时间(ms)
+      rise: 28,            // 上浮总距离(px)
+      color: "#ffe680",
+    },
+
+    // 屏幕震动：击毁/受击时短促抖动画面，增强打击感
+    shake: {
+      killAmp: 4,          // 击毁敌机震幅(px)
+      crashAmp: 9,         // 玩家受击震幅(px)
+      decayMs: 260,        // 震动衰减时长(ms)
+    },
 
     // 难度递增参数
     difficulty: {
@@ -144,7 +163,7 @@
     },
   };
 
-  // 游戏状态机：'ready' | 'playing' | 'over'
+  // 游戏状态机：'ready' | 'playing' | 'paused' | 'over'
   const Game = {
     state: "ready",
     score: 0,
@@ -154,6 +173,9 @@
     lastEnemySpawn: 0,
     lastFire: 0,
     lastManualFire: 0, // 空格手动射击冷却计时
+    invincible: 0,     // 剩余无敌时间(ms)，>0 时玩家不再扣血
+    shake: 0,          // 剩余屏幕震动时间(ms)
+    shakeAmp: 0,       // 当前震动幅度(px)
   };
 
   // 读取本地最高分（带容错：非数字或被篡改为负数时忽略）
@@ -166,6 +188,7 @@
   let bullets = [];
   let enemies = [];
   let particles = [];
+  let scorePops = [];
   let stars = [];
 
   /* ===================== 2. 输入处理 ===================== */
@@ -183,6 +206,10 @@
     }
     if (k === "enter") {
       if (Game.state === "ready" || Game.state === "over") startGame();
+    }
+    // 暂停 / 继续：P 或 Esc，仅在游戏进行/暂停态间切换
+    if (k === "p" || k === "escape") {
+      togglePause();
     }
   }
   function onKeyUp(e) {
@@ -209,6 +236,21 @@
     if (pointerActive) pointerMove(e.clientX, e.clientY);
   });
   window.addEventListener("pointerup", () => { pointerActive = false; });
+
+  // 暂停切换：playing ⇄ paused，其它状态忽略
+  function togglePause() {
+    if (Game.state === "playing") Game.state = "paused";
+    else if (Game.state === "paused") Game.state = "playing";
+  }
+
+  // 切出标签页 / 窗口失焦时自动暂停，避免“切回来已经死了”
+  function autoPause() {
+    if (Game.state === "playing") Game.state = "paused";
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) autoPause();
+  });
+  window.addEventListener("blur", autoPause);
 
   /* ===================== 3. 实体类 ===================== */
 
@@ -257,8 +299,11 @@
     draw() {
       drawAt(this.x, this.y, () => {
         const col = CONFIG.colors.player;
-        if (this.hitFlash > 0 &&
-            Math.floor(this.hitFlash / CONFIG.player.flashBlinkMs) % 2 === 0) {
+        // 受击/无敌期间闪烁，给玩家“当前无敌”的视觉反馈
+        const blinking = this.hitFlash > 0 || Game.invincible > 0;
+        const phase = Math.max(this.hitFlash, Game.invincible);
+        if (blinking &&
+            Math.floor(phase / CONFIG.player.flashBlinkMs) % 2 === 0) {
           ctx.globalAlpha = 0.4;
         }
         // 机身
@@ -382,6 +427,33 @@
     }
   }
 
+  // 得分飘字：在击毁位置弹出 "+分数"，随时间上浮并淡出
+  class ScorePop {
+    constructor(x, y, value) {
+      this.x = x;
+      this.y = y;
+      this.value = value;
+      this.life = CONFIG.scorePop.life;
+      this.maxLife = this.life;
+      this.dead = false;
+    }
+    update(dt) {
+      this.life -= dt;
+      if (this.life <= 0) this.dead = true;
+    }
+    draw() {
+      const sp = CONFIG.scorePop;
+      const t = 1 - this.life / this.maxLife;   // 0→1 进度
+      ctx.save();
+      ctx.globalAlpha = Math.max(0, this.life / this.maxLife);
+      ctx.fillStyle = sp.color;
+      ctx.font = "bold 16px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("+" + this.value, this.x, this.y - t * sp.rise);
+      ctx.restore();
+    }
+  }
+
   // 背景星空
   function initStars() {
     const sc = CONFIG.stars;
@@ -418,6 +490,12 @@
     for (let i = 0; i < fx.count; i++) particles.push(new Particle(x, y, fx.color));
   }
 
+  // 触发屏幕震动：取较大的幅度，刷新衰减计时（多次命中不会越来越弱）
+  function triggerShake(amp) {
+    Game.shakeAmp = Math.max(Game.shakeAmp, amp);
+    Game.shake = CONFIG.shake.decayMs;
+  }
+
   function fire() {
     if (!player) return;
     bullets.push(new Bullet(player.x, player.y - player.h / 2));
@@ -434,10 +512,14 @@
     return Math.max(CONFIG.enemy.minSpawn, CONFIG.enemy.baseSpawn - reduce);
   }
 
-  // AABB 矩形相交检测
-  function hit(a, b) {
-    return Math.abs(a.x - b.x) * 2 < (a.w + b.w) &&
-           Math.abs(a.y - b.y) * 2 < (a.h + b.h);
+  // AABB 矩形相交检测。
+  // sa/sb 为 a、b 各自的命中范围缩放（默认 1 = 用完整尺寸）；
+  // 玩家碰撞时传入较小的 scale，只让机身中间一小块算被撞。
+  function hit(a, b, sa, sb) {
+    const aw = a.w * (sa || 1), ah = a.h * (sa || 1);
+    const bw = b.w * (sb || 1), bh = b.h * (sb || 1);
+    return Math.abs(a.x - b.x) * 2 < (aw + bw) &&
+           Math.abs(a.y - b.y) * 2 < (ah + bh);
   }
 
   function handleCollisions() {
@@ -454,19 +536,24 @@
             e.dead = true;
             Game.score += e.value;
             spawnExplosion(e.x, e.y, CONFIG.fx.enemyKill);
+            scorePops.push(new ScorePop(e.x, e.y, e.value)); // 得分飘字
+            triggerShake(CONFIG.shake.killAmp);               // 屏幕震一下
           }
           break;
         }
       }
     }
-    // 敌机 vs 玩家
-    if (player) {
+    // 敌机 vs 玩家：无敌时间内跳过整次判定，避免一帧内被多架敌机连扣
+    if (player && Game.invincible <= 0) {
       for (const e of enemies) {
         if (e.dead) continue;
-        if (hit(player, e)) {
+        // 玩家命中范围缩小到机身中间一小块（hitboxScale），敌机用完整尺寸
+        if (hit(player, e, CONFIG.player.hitboxScale, 1)) {
           e.dead = true;
           spawnExplosion(e.x, e.y, CONFIG.fx.playerCrash);
+          triggerShake(CONFIG.shake.crashAmp);
           damagePlayer();
+          break; // 本次只受一击，剩余敌机留待无敌结束后再判定
         }
       }
     }
@@ -475,6 +562,7 @@
   function damagePlayer() {
     Game.hp -= 1;
     if (player) player.hitFlash = CONFIG.player.hitFlashMs;
+    Game.invincible = CONFIG.player.invincibleMs; // 受击后给一段无敌缓冲
     if (Game.hp <= 0) {
       Game.hp = 0;
       endGame();
@@ -491,9 +579,13 @@
     Game.lastEnemySpawn = 0;
     Game.lastFire = 0;
     Game.lastManualFire = 0;
+    Game.invincible = 0;
+    Game.shake = 0;
+    Game.shakeAmp = 0;
     bullets = [];
     enemies = [];
     particles = [];
+    scorePops = [];
     player = new Player();
   }
 
@@ -515,10 +607,22 @@
     // 粒子始终更新（用于结束动画）
     for (const p of particles) p.update(dt);
     particles = particles.filter((p) => !p.dead);
+    // 得分飘字始终更新淡出
+    for (const sp of scorePops) sp.update(dt);
+    scorePops = scorePops.filter((sp) => !sp.dead);
+    // 屏幕震动衰减（即使非 playing 也让它自然归零）
+    if (Game.shake > 0) {
+      Game.shake -= dt;
+      if (Game.shake <= 0) { Game.shake = 0; Game.shakeAmp = 0; }
+    }
 
+    // paused / ready / over 都不推进游戏逻辑
     if (Game.state !== "playing") return;
 
     Game.elapsed += dt;
+
+    // 无敌计时倒数
+    if (Game.invincible > 0) Game.invincible -= dt;
 
     // 玩家
     player.update(dt);
@@ -540,10 +644,12 @@
     for (const b of bullets) b.update(dt);
     bullets = bullets.filter((b) => !b.dead);
 
-    // 敌机生成
+    // 敌机生成（受屏幕数量上限约束，避免后期“一堵墙”）
     Game.lastEnemySpawn += dt;
     if (Game.lastEnemySpawn >= spawnInterval()) {
-      enemies.push(new Enemy(difficultyScale()));
+      if (enemies.length < CONFIG.enemy.maxOnScreen) {
+        enemies.push(new Enemy(difficultyScale()));
+      }
       Game.lastEnemySpawn = 0;
     }
     for (const e of enemies) e.update(dt);
@@ -599,20 +705,38 @@
   function render() {
     drawBackground();
 
-    for (const p of particles) p.draw();
+    // 屏幕震动：对背景之外的所有内容施加随机平移偏移
+    ctx.save();
+    if (Game.shake > 0 && Game.shakeAmp > 0) {
+      const k = Game.shake / CONFIG.shake.decayMs;        // 1→0 衰减
+      const amp = Game.shakeAmp * k;
+      ctx.translate((Math.random() * 2 - 1) * amp,
+                    (Math.random() * 2 - 1) * amp);
+    }
 
-    if (Game.state === "playing") {
+    for (const p of particles) p.draw();
+    for (const sp of scorePops) sp.draw();
+
+    if (Game.state === "playing" || Game.state === "paused") {
       for (const b of bullets) b.draw();
       for (const e of enemies) e.draw();
       if (player) player.draw();
       drawHUD();
+      if (Game.state === "paused") {
+        // 半透明遮罩 + 暂停提示
+        ctx.save();
+        ctx.fillStyle = "rgba(6, 10, 28, 0.6)";
+        ctx.fillRect(0, 0, W, H);
+        ctx.restore();
+        drawCenterText("已暂停", "按 P / Esc 继续");
+      }
     } else if (Game.state === "ready") {
       drawCenterText("飞机大战", "按 回车 / 点击屏幕 开始");
       ctx.save();
       ctx.textAlign = "center";
       ctx.fillStyle = "#6f7fb0";
       ctx.font = "13px sans-serif";
-      ctx.fillText("方向键 / WASD 移动 · 自动射击（空格加射）", W / 2, H / 2 + 60);
+      ctx.fillText("方向键 / WASD 移动 · 自动射击（空格加射） · P/Esc 暂停", W / 2, H / 2 + 60);
       ctx.restore();
     } else if (Game.state === "over") {
       drawHUD();
@@ -624,6 +748,8 @@
       ctx.fillText("按 回车 / 点击 重新开始", W / 2, H / 2 + 60);
       ctx.restore();
     }
+
+    ctx.restore(); // 结束震动偏移
   }
 
   // 主循环（带 dt 钳制，防止切后台后 dt 暴增）

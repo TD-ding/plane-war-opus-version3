@@ -226,6 +226,7 @@
       pickup:   { type: "triangle", f0: 660,  f1: 1320, dur: 0.16, vol: 0.6  },
       bomb:     { type: "sawtooth", f0: 420,  f1: 50,   dur: 0.5,  dur2: 0.5, vol: 1.0 },
       powerup:  { type: "triangle", f0: 520,  f1: 1040, dur: 0.18, vol: 0.6  },
+      shieldBlock: { type: "triangle", f0: 1200, f1: 1800, dur: 0.1, vol: 0.5 }, // 护盾挡弹的金属“叮”声
     },
   };
 
@@ -271,6 +272,7 @@
   const Sound = (function () {
     let actx = null;
     let muted = false;
+    let primed = false;
 
     function ensure() {
       if (actx) return actx;
@@ -280,10 +282,28 @@
       } catch (e) { actx = null; }
       return actx;
     }
-    // 用户交互后恢复（部分浏览器初始为 suspended）
+    // 在上下文里跑一个 0 音量的极短音，把音频图“热身”起来。
+    // 部分浏览器新建/刚 resume 的 AudioContext 第一声会被丢掉，
+    // 故首次交互时静音预热一次，保证后续第一次开火就有声。
+    function prime(a) {
+      if (primed || !a) return;
+      primed = true;
+      try {
+        const now = a.currentTime;
+        const osc = a.createOscillator();
+        const gain = a.createGain();
+        gain.gain.setValueAtTime(0.0001, now);
+        osc.connect(gain).connect(a.destination);
+        osc.start(now);
+        osc.stop(now + 0.02);
+      } catch (e) { /* 预热失败不影响游戏 */ }
+    }
+    // 用户交互后恢复（部分浏览器初始为 suspended），并做一次预热
     function resume() {
       const a = ensure();
-      if (a && a.state === "suspended") a.resume().catch(() => {});
+      if (!a) return;
+      if (a.state === "suspended") a.resume().catch(() => {});
+      prime(a);
     }
 
     // 播放一个频率从 f0 滑到 f1 的短音；带快速衰减包络，听感像“电子音效”
@@ -291,6 +311,9 @@
       if (muted || !spec) return;
       const a = ensure();
       if (!a) return;
+      // 首次发声前确保上下文已 running：浏览器新建的 AudioContext 常为
+      // suspended，若不在调度前 resume，第一声会被丢掉（开火没声音的根因）
+      if (a.state === "suspended") a.resume().catch(() => {});
       try {
         const now = a.currentTime;
         const osc = a.createOscillator();
@@ -318,6 +341,7 @@
       crash()   { play(CONFIG.sound.crash); },
       pickup()  { play(CONFIG.sound.pickup); },
       powerup() { play(CONFIG.sound.powerup); },
+      shieldBlock() { play(CONFIG.sound.shieldBlock); },
       bomb()    { play(CONFIG.sound.bomb); },
     };
   })();
@@ -905,13 +929,20 @@
         }
       }
     }
-    // 敌弹 vs 玩家：护盾/无敌期间不掉血
-    if (player && Game.invincible <= 0 && Game.shieldTime <= 0) {
+    // 敌弹 vs 玩家：护盾/无敌期间不掉血，但子弹仍会被挡掉（爆炸消失），不再幽灵穿身
+    if (player) {
+      const shielded = Game.invincible > 0 || Game.shieldTime > 0;
       for (const eb of enemyBullets) {
         if (eb.dead) continue;
         if (hit(player, eb, CONFIG.player.hitboxScale, 1)) {
           eb.dead = true;
-          spawnExplosion(player.x, player.y, CONFIG.fx.playerCrash);
+          spawnExplosion(eb.x, eb.y, CONFIG.fx.playerCrash);
+          if (shielded) {
+            // 护盾/无敌：挡掉子弹但不掉血、不连击清零；继续判定其余子弹，
+            // 这样同一帧内多发子弹都会被挡下，不会有漏网的穿身
+            Sound.shieldBlock();
+            continue;
+          }
           triggerShake(CONFIG.shake.crashAmp);
           Sound.crash();
           damagePlayer();
